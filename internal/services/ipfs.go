@@ -181,10 +181,42 @@ type FreelancerLetGoMetadata struct {
 	FreelancerAddress string  `json:"freelancer_address"`
 	CreatorAddress    string  `json:"creator_address"`
 	RefundedAlgo      float64 `json:"refunded_algo"`
+	RatingReset       bool    `json:"rating_reset"` // v3.3: freelancer ratings set to 0
 	TxnID             string  `json:"txn_id"`
 	Timestamp         string  `json:"timestamp"`
 	Platform          string  `json:"platform"`
 	Network           string  `json:"network"`
+}
+
+// BountyAcceptedMetadata is pinned when creator accepts freelancer and deploys escrow (v3.3)
+type BountyAcceptedMetadata struct {
+	Event              string  `json:"event"`
+	BountyID           string  `json:"bounty_id"`
+	AppID              int64   `json:"app_id"`
+	CreatorAddress     string  `json:"creator_address"`
+	FreelancerAddress  string  `json:"freelancer_address"`
+	RewardAlgo         float64 `json:"reward_algo"`
+	MaxSubmissions     int     `json:"max_submissions"`
+	Deadline           string  `json:"deadline"`
+	EscrowTxnID        string  `json:"escrow_txn_id"`
+	Timestamp          string  `json:"timestamp"`
+	Platform           string  `json:"platform"`
+	Network            string  `json:"network"`
+}
+
+// WorkResubmittedMetadata is pinned when freelancer resubmits after rejection (v3.3)
+type WorkResubmittedMetadata struct {
+	Event              string `json:"event"`
+	BountyID           string `json:"bounty_id"`
+	SubmissionNumber   int    `json:"submission_number"`
+	FreelancerAddress  string `json:"freelancer_address"`
+	MegaNZLink         string `json:"mega_nz_link"`
+	DescriptionPreview string `json:"description_preview"`
+	WorkHashSHA256     string `json:"work_hash_sha256"`
+	TxnID              string `json:"txn_id"`
+	Timestamp          string `json:"timestamp"`
+	Platform           string `json:"platform"`
+	Network            string `json:"network"`
 }
 
 // ============================================================
@@ -330,6 +362,25 @@ func (s *IPFSService) PinFreelancerLetGo(ctx context.Context, data FreelancerLet
 	data.Platform = "BountyVault"
 	data.Timestamp = time.Now().UTC().Format(time.RFC3339)
 	return s.PinJSON(ctx, fmt.Sprintf("letgo-%s", data.BountyID), data)
+}
+
+// PinBountyAccepted pins acceptance metadata when creator accepts freelancer (v3.3)
+func (s *IPFSService) PinBountyAccepted(ctx context.Context, data BountyAcceptedMetadata) (*PinResult, error) {
+	data.Event = "bounty_accepted"
+	data.Platform = "BountyVault"
+	data.Timestamp = time.Now().UTC().Format(time.RFC3339)
+	return s.PinJSON(ctx, fmt.Sprintf("accepted-%s", data.BountyID), data)
+}
+
+// PinWorkResubmitted pins resubmission metadata (v3.3)
+func (s *IPFSService) PinWorkResubmitted(ctx context.Context, data WorkResubmittedMetadata) (*PinResult, error) {
+	data.Event = "work_resubmitted"
+	data.Platform = "BountyVault"
+	data.Timestamp = time.Now().UTC().Format(time.RFC3339)
+	if len(data.DescriptionPreview) > 200 {
+		data.DescriptionPreview = data.DescriptionPreview[:200] + "..."
+	}
+	return s.PinJSON(ctx, fmt.Sprintf("resubmit-%s-%d", data.BountyID, data.SubmissionNumber), data)
 }
 
 // GetGatewayURL returns the public gateway URL for a given CID

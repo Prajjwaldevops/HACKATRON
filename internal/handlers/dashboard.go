@@ -233,22 +233,40 @@ func (h *DashboardHandler) GetMySubmissions(c *gin.Context) {
 	c.JSON(200, models.APIResponse{Success: true, Data: submissions})
 }
 
-// GET /api/dashboard/working-bounties — Bounties where the freelancer has active submissions
+// GET /api/dashboard/working-bounties — Bounties where freelancer is accepted and can submit work
 func (h *DashboardHandler) GetWorkingBounties(c *gin.Context) {
 	pid, _ := c.Get("profile_id")
 
 	rows, err := database.DB.Query(`
 		SELECT b.id, b.title, b.description, b.reward_algo, b.deadline, b.status,
-		       b.max_submissions, b.tags, b.created_at,
-		       s.status as submission_status, s.created_at, s.id as submission_id,
+		       b.max_submissions, b.submissions_remaining, b.tags, b.created_at,
+		       COALESCE(
+		         (SELECT s.status FROM submissions s
+		          WHERE s.bounty_id = b.id AND s.freelancer_id = $1
+		          ORDER BY s.created_at DESC LIMIT 1), 'none'
+		       ) as latest_sub_status,
+		       COALESCE(
+		         (SELECT s.id FROM submissions s
+		          WHERE s.bounty_id = b.id AND s.freelancer_id = $1
+		          ORDER BY s.created_at DESC LIMIT 1), ''
+		       ) as latest_sub_id,
+		       COALESCE(
+		         (SELECT s.created_at FROM submissions s
+		          WHERE s.bounty_id = b.id AND s.freelancer_id = $1
+		          ORDER BY s.created_at DESC LIMIT 1), b.created_at
+		       ) as latest_sub_at,
+		       COALESCE(
+		         (SELECT s.rejection_feedback FROM submissions s
+		          WHERE s.bounty_id = b.id AND s.freelancer_id = $1 AND s.status = 'rejected'
+		          ORDER BY s.created_at DESC LIMIT 1), ''
+		       ) as last_rejection_feedback,
 		       (SELECT COUNT(*) FROM submissions sub WHERE sub.bounty_id = b.id) as sub_count,
 		       p.username as creator_username
-		FROM submissions s
-		JOIN bounties b ON s.bounty_id = b.id
+		FROM bounties b
 		JOIN profiles p ON b.creator_id = p.id
-		WHERE s.freelancer_id = $1
-		  AND b.status IN ('open', 'in_progress')
-		ORDER BY s.created_at DESC
+		WHERE b.accepted_freelancer_id = $1
+		  AND b.status IN ('in_progress', 'expired')
+		ORDER BY b.updated_at DESC
 		LIMIT 20
 	`, pid)
 	if err != nil {
@@ -259,31 +277,49 @@ func (h *DashboardHandler) GetWorkingBounties(c *gin.Context) {
 
 	var bounties []gin.H
 	for rows.Next() {
-		var id, title, desc, bStatus, subStatus, subID, creatorUsername string
+		var id, title, desc, bStatus, latestSubStatus, latestSubID, creatorUsername string
+		var lastRejFeedback string
 		var reward float64
-		var deadline, createdAt, submittedAt time.Time
-		var maxSubs, subCount int
+		var deadline, createdAt, latestSubAt time.Time
+		var maxSubs, subsRemaining, subCount int
 		var tags []string
 
 		rows.Scan(&id, &title, &desc, &reward, &deadline, &bStatus,
-			&maxSubs, pq.Array(&tags), &createdAt,
-			&subStatus, &submittedAt, &subID, &subCount, &creatorUsername)
+			&maxSubs, &subsRemaining, pq.Array(&tags), &createdAt,
+			&latestSubStatus, &latestSubID, &latestSubAt,
+			&lastRejFeedback, &subCount, &creatorUsername)
+
+		// Can submit if: bounty in_progress, no pending submission, and remaining slots > 0
+		canSubmit := bStatus == "in_progress" &&
+			(latestSubStatus == "none" || latestSubStatus == "rejected") &&
+			subsRemaining > 0
+		// Can resubmit if latest was rejected and slots remain
+		canResubmit := latestSubStatus == "rejected" && subsRemaining > 0
+		// Can let go or dispute if expired
+		canLetGo := bStatus == "expired"
+		canDispute := bStatus == "expired"
 
 		bounties = append(bounties, gin.H{
-			"id":                id,
-			"title":             title,
-			"description":       desc,
-			"reward_algo":       reward,
-			"deadline":          deadline,
-			"status":            bStatus,
-			"max_submissions":   maxSubs,
-			"tags":              tags,
-			"created_at":        createdAt,
-			"submission_status": subStatus,
-			"submitted_at":      submittedAt,
-			"submission_id":     subID,
-			"submission_count":  subCount,
-			"creator_username":  creatorUsername,
+			"id":                    id,
+			"title":                 title,
+			"description":           desc,
+			"reward_algo":           reward,
+			"deadline":              deadline,
+			"status":                bStatus,
+			"max_submissions":       maxSubs,
+			"submissions_remaining": subsRemaining,
+			"tags":                  tags,
+			"created_at":            createdAt,
+			"submission_status":     latestSubStatus,
+			"submitted_at":          latestSubAt,
+			"submission_id":         latestSubID,
+			"submission_count":      subCount,
+			"creator_username":      creatorUsername,
+			"rejection_feedback":    lastRejFeedback,
+			"can_submit":            canSubmit,
+			"can_resubmit":          canResubmit,
+			"can_let_go":            canLetGo,
+			"can_dispute":           canDispute,
 		})
 	}
 
@@ -610,3 +646,71 @@ func (h *DashboardHandler) GetMyAcceptances(c *gin.Context) {
 	c.JSON(200, models.APIResponse{Success: true, Data: acceptances})
 }
 
+
+// GET /api/dashboard/transactions — Transaction log for the authenticated user
+func (h *DashboardHandler) GetTransactionLog(c *gin.Context) {
+	pid, _ := c.Get("profile_id")
+
+	rows, err := database.DB.Query(`
+		SELECT t.id, t.bounty_id, t.actor_id, t.event, t.txn_id, t.txn_note,
+		       t.ipfs_metadata_cid, t.amount_algo, t.created_at,
+		       COALESCE(p.username, '') as actor_username,
+		       COALESCE(b.title, '') as bounty_title,
+		       COALESCE(b.bounty_id, '') as bounty_display_id
+		FROM transaction_log t
+		LEFT JOIN profiles p ON t.actor_id = p.id
+		LEFT JOIN bounties b ON t.bounty_id = b.id
+		WHERE t.actor_id = $1
+		   OR t.bounty_id IN (SELECT id FROM bounties WHERE creator_id = $1)
+		   OR t.bounty_id IN (SELECT id FROM bounties WHERE accepted_freelancer_id = $1)
+		ORDER BY t.created_at DESC
+		LIMIT 50
+	`, pid)
+	if err != nil {
+		c.JSON(500, models.APIResponse{Success: false, Error: "Failed to fetch transactions"})
+		return
+	}
+	defer rows.Close()
+
+	var txns []gin.H
+	for rows.Next() {
+		var id, event string
+		var bountyID, actorID, txnID, txnNote, ipfsCID *string
+		var amountAlgo *float64
+		var createdAt time.Time
+		var actorUsername, bountyTitle, bountyDisplayID string
+
+		rows.Scan(&id, &bountyID, &actorID, &event, &txnID, &txnNote,
+			&ipfsCID, &amountAlgo, &createdAt,
+			&actorUsername, &bountyTitle, &bountyDisplayID)
+
+		// Build IPFS gateway URL if CID present
+		var ipfsURL *string
+		if ipfsCID != nil && *ipfsCID != "" {
+			url := "https://gateway.pinata.cloud/ipfs/" + *ipfsCID
+			ipfsURL = &url
+		}
+
+		txns = append(txns, gin.H{
+			"id":               id,
+			"bounty_id":        bountyID,
+			"actor_id":         actorID,
+			"event":            event,
+			"txn_id":           txnID,
+			"txn_note":         txnNote,
+			"ipfs_metadata_cid": ipfsCID,
+			"ipfs_gateway_url": ipfsURL,
+			"amount_algo":      amountAlgo,
+			"created_at":       createdAt,
+			"actor_username":   actorUsername,
+			"bounty_title":     bountyTitle,
+			"bounty_display_id": bountyDisplayID,
+		})
+	}
+
+	if txns == nil {
+		txns = []gin.H{}
+	}
+
+	c.JSON(200, models.APIResponse{Success: true, Data: txns})
+}

@@ -233,6 +233,52 @@ func (s *R2Service) DeleteObject(ctx context.Context, objectKey string) error {
 	return err
 }
 
+// UploadEncryptionKey uploads a .txt file containing the mega.nz decryption key to R2
+// Path format: bountyvault-keys/{freelancer_id}/{bounty_id}/{sub_num}/{uuid}.txt
+// Returns the R2 path and a SHA256 hash of (mega_link + r2_path) for on-chain proof
+func (s *R2Service) UploadEncryptionKey(
+	ctx context.Context,
+	freelancerID, bountyID string,
+	submissionNumber int,
+	content []byte,
+	megaNZLink string,
+) (*R2UploadResult, error) {
+	if len(content) > 1024 {
+		return nil, fmt.Errorf("encryption key file too large: max 1KB")
+	}
+
+	fileID := uuid.New().String()
+	objectKey := fmt.Sprintf("bountyvault-keys/%s/%s/%d/%s.txt",
+		freelancerID, bountyID, submissionNumber, fileID)
+
+	reader := strings.NewReader(string(content))
+	contentLen := int64(len(content))
+
+	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:        aws.String(s.bucketName),
+		Key:           aws.String(objectKey),
+		Body:          reader,
+		ContentType:   aws.String("text/plain"),
+		ContentLength: aws.Int64(contentLen),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("R2 encryption key upload failed: %w", err)
+	}
+
+	// Compute work hash: SHA256(mega_nz_link + r2_path) — stored on-chain
+	hashInput := fmt.Sprintf("%s_%s", megaNZLink, objectKey)
+	hash := sha256.Sum256([]byte(hashInput))
+	workHashHex := fmt.Sprintf("%x", hash)
+
+	return &R2UploadResult{
+		Path:           objectKey,
+		PublicURL:      fmt.Sprintf("%s/%s", s.publicURL, objectKey),
+		FileSize:       contentLen,
+		FileType:       "txt",
+		WorkHashSHA256: workHashHex,
+	}, nil
+}
+
 func getContentType(ext string) string {
 	switch ext {
 	case ".pdf":

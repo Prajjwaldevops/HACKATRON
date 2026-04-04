@@ -335,85 +335,125 @@ func (h *BountyHandler) ConfirmLock(c *gin.Context) {
 	c.JSON(200, models.APIResponse{Success: true, Message: "Funds locked on-chain", Data: gin.H{"txn_id": txID, "app_id": req.AppID}})
 }
 
-// POST /api/bounties/:id/submit — Freelancer submits work file via multipart
+// POST /api/bounties/:id/submit — Freelancer submits work (v3.3: mega.nz link + encryption key .txt)
 func (h *BountyHandler) SubmitWork(c *gin.Context) {
 	bid := c.Param("id")
 	pid, _ := c.Get("profile_id")
 
-	file, fileHeader, err := c.Request.FormFile("file")
+	// Parse multipart form
+	megaNZLink := strings.TrimSpace(c.PostForm("mega_nz_link"))
+	description := strings.TrimSpace(c.PostForm("description"))
+
+	if megaNZLink == "" {
+		c.JSON(400, models.APIResponse{Success: false, Error: "mega.nz link is required"})
+		return
+	}
+	if description == "" {
+		c.JSON(400, models.APIResponse{Success: false, Error: "Description is required"})
+		return
+	}
+
+	// Validate mega.nz link (format + HTTP reachability)
+	megaValidator := services.NewMegaNZValidator()
+	if err := megaValidator.ValidateMegaLink(megaNZLink); err != nil {
+		c.JSON(400, models.APIResponse{Success: false, Error: err.Error()})
+		return
+	}
+
+	// Read and validate encryption key .txt file
+	file, _, err := c.Request.FormFile("encryption_key")
 	if err != nil {
-		c.JSON(400, models.APIResponse{Success: false, Error: "File is required"})
+		c.JSON(400, models.APIResponse{Success: false, Error: "Encryption key .txt file is required"})
 		return
 	}
 	defer file.Close()
 
-	description := c.PostForm("description")
-	if strings.TrimSpace(description) == "" {
-		c.JSON(400, models.APIResponse{Success: false, Error: "Description is required"})
+	keyContent := make([]byte, 2048) // max read
+	n, _ := file.Read(keyContent)
+	keyContent = keyContent[:n]
+
+	if err := services.ValidateEncryptionKeyContent(keyContent); err != nil {
+		c.JSON(400, models.APIResponse{Success: false, Error: err.Error()})
 		return
 	}
 
 	// Check bounty exists and is accepting submissions
 	var status, creatorID string
-	var maxS, remaining int
-	var rewardAlgo float64
+	var remaining int
 	var bountyDisplayID string
 	var appID *int64
+	var acceptedFreelancerID *string
 	err = database.DB.QueryRow(`
-		SELECT status, creator_id, max_submissions, submissions_remaining, reward_algo, bounty_id, app_id
+		SELECT status, creator_id, submissions_remaining, bounty_id, app_id, accepted_freelancer_id
 		FROM bounties WHERE id = $1
-	`, bid).Scan(&status, &creatorID, &maxS, &remaining, &rewardAlgo, &bountyDisplayID, &appID)
+	`, bid).Scan(&status, &creatorID, &remaining, &bountyDisplayID, &appID, &acceptedFreelancerID)
 	if err != nil {
 		c.JSON(404, models.APIResponse{Success: false, Error: "Bounty not found"})
 		return
 	}
-	if status != "open" && status != "in_progress" {
-		c.JSON(400, models.APIResponse{Success: false, Error: "Bounty not accepting submissions"})
+	if status != "in_progress" {
+		c.JSON(400, models.APIResponse{Success: false, Error: "Bounty is not in progress — cannot submit work"})
 		return
 	}
 	if creatorID == pid.(string) {
 		c.JSON(400, models.APIResponse{Success: false, Error: "Creator cannot submit work"})
 		return
 	}
+	// Only the accepted freelancer can submit
+	if acceptedFreelancerID == nil || *acceptedFreelancerID != pid.(string) {
+		c.JSON(403, models.APIResponse{Success: false, Error: "Only the accepted freelancer can submit work"})
+		return
+	}
+	if remaining <= 0 {
+		c.JSON(400, models.APIResponse{Success: false, Error: "No submission slots remaining"})
+		return
+	}
 
-	// Get submission number for this freelancer
+	// Get submission number (supports resubmissions)
 	var subNum int
 	database.DB.QueryRow(`SELECT COALESCE(MAX(submission_number), 0) + 1 FROM submissions WHERE bounty_id = $1 AND freelancer_id = $2`, bid, pid).Scan(&subNum)
 
-	// Upload file to Cloudflare R2 with magic-byte validation
-	r2Result, err := h.r2Svc.UploadSubmission(
+	// Upload encryption key to Cloudflare R2
+	r2Result, err := h.r2Svc.UploadEncryptionKey(
 		c.Request.Context(),
 		pid.(string), bid, subNum,
-		file, fileHeader.Filename, fileHeader.Size,
+		keyContent, megaNZLink,
 	)
 	if err != nil {
-		c.JSON(400, models.APIResponse{Success: false, Error: "File validation/upload failed: " + err.Error()})
+		c.JSON(500, models.APIResponse{Success: false, Error: "Failed to upload encryption key: " + err.Error()})
 		return
 	}
+
+	// Generate presigned URL for the encryption key file
+	signedURL, _ := h.r2Svc.GenerateSignedURL(c.Request.Context(), r2Result.Path)
 
 	// Insert submission record
 	sid := uuid.New()
 	_, err = database.DB.Exec(`
-		INSERT INTO submissions (id, bounty_id, freelancer_id, submission_number, file_url,
-		  file_type, file_size_bytes, description, status, work_hash_sha256)
+		INSERT INTO submissions (id, bounty_id, freelancer_id, submission_number,
+		  mega_nz_link, encryption_key_r2_path, encryption_key_r2_url,
+		  description, status, work_hash_sha256)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9)
-	`, sid, bid, pid, subNum, r2Result.Path, r2Result.FileType, r2Result.FileSize, description, r2Result.WorkHashSHA256)
+	`, sid, bid, pid, subNum, megaNZLink, r2Result.Path, signedURL, description, r2Result.WorkHashSHA256)
 	if err != nil {
-		c.JSON(500, models.APIResponse{Success: false, Error: "Failed to record submission"})
+		c.JSON(500, models.APIResponse{Success: false, Error: "Failed to record submission: " + err.Error()})
 		return
 	}
-
-	database.DB.Exec(`UPDATE bounties SET status = 'in_progress', updated_at = NOW() WHERE id = $1 AND status = 'open'`, bid)
 
 	// Record in transaction_log
 	appIDVal := int64(0)
 	if appID != nil {
 		appIDVal = *appID
 	}
+
+	event := "work_submitted"
+	if subNum > 1 {
+		event = "work_resubmitted"
+	}
 	database.DB.Exec(`
 		INSERT INTO transaction_log (bounty_id, actor_id, event, txn_note, amount_algo)
-		VALUES ($1, $2, 'work_submitted', $3, 0)
-	`, bid, pid, fmt.Sprintf("BountyVault:work_submitted:%d", appIDVal))
+		VALUES ($1, $2, $3, $4, 0)
+	`, bid, pid, event, fmt.Sprintf("BountyVault:%s:%d", event, appIDVal))
 
 	// Pin submission metadata to IPFS (fire-and-forget)
 	go func() {
@@ -423,19 +463,37 @@ func (h *BountyHandler) SubmitWork(c *gin.Context) {
 		if len(descPreview) > 200 {
 			descPreview = descPreview[:200] + "..."
 		}
-		_, err := h.ipfsSvc.PinWorkSubmitted(context.Background(), services.WorkSubmittedMetadata{
-			BountyID:           bountyDisplayID,
-			SubmissionNumber:   subNum,
-			FreelancerAddress:  workerAddr,
-			FileR2Path:         r2Result.Path,
-			FileType:           r2Result.FileType,
-			FileSizeBytes:      r2Result.FileSize,
-			DescriptionPreview: descPreview,
-			WorkHashSHA256:     r2Result.WorkHashSHA256,
-			Network:            h.cfg.AlgoNetwork,
-		})
-		if err != nil {
-			log.Printf("[WARN] IPFS pin failed for submission %s: %v", sid, err)
+
+		if subNum > 1 {
+			// Resubmission
+			_, err := h.ipfsSvc.PinWorkResubmitted(context.Background(), services.WorkResubmittedMetadata{
+				BountyID:           bountyDisplayID,
+				SubmissionNumber:   subNum,
+				FreelancerAddress:  workerAddr,
+				MegaNZLink:         megaNZLink,
+				DescriptionPreview: descPreview,
+				WorkHashSHA256:     r2Result.WorkHashSHA256,
+				Network:            h.cfg.AlgoNetwork,
+			})
+			if err != nil {
+				log.Printf("[WARN] IPFS pin failed for resubmission %s: %v", sid, err)
+			}
+		} else {
+			// First submission
+			_, err := h.ipfsSvc.PinWorkSubmitted(context.Background(), services.WorkSubmittedMetadata{
+				BountyID:           bountyDisplayID,
+				SubmissionNumber:   subNum,
+				FreelancerAddress:  workerAddr,
+				FileR2Path:         r2Result.Path,
+				FileType:           "txt",
+				FileSizeBytes:      r2Result.FileSize,
+				DescriptionPreview: descPreview,
+				WorkHashSHA256:     r2Result.WorkHashSHA256,
+				Network:            h.cfg.AlgoNetwork,
+			})
+			if err != nil {
+				log.Printf("[WARN] IPFS pin failed for submission %s: %v", sid, err)
+			}
 		}
 	}()
 
@@ -443,10 +501,10 @@ func (h *BountyHandler) SubmitWork(c *gin.Context) {
 		Success: true,
 		Message: "Work submitted successfully",
 		Data: gin.H{
-			"submission_id":    sid,
+			"submission_id":     sid,
 			"submission_number": subNum,
-			"file_type":        r2Result.FileType,
-			"work_hash":        r2Result.WorkHashSHA256,
+			"mega_nz_link":      megaNZLink,
+			"work_hash":         r2Result.WorkHashSHA256,
 		},
 	})
 }
@@ -608,6 +666,21 @@ func (h *BountyHandler) RejectSubmission(c *gin.Context) {
 		WHERE id = $1 RETURNING submissions_remaining
 	`, bid).Scan(&remaining)
 
+	// If all submission slots exhausted, set bounty status to 'expired'
+	if remaining == 0 {
+		database.DB.Exec(`UPDATE bounties SET status = 'expired', updated_at = NOW() WHERE id = $1`, bid)
+	}
+
+	// Notify freelancer
+	database.DB.Exec(`
+		INSERT INTO notifications (user_id, type, title, message, bounty_id)
+		VALUES ($1, 'submission_rejected', 'Submission Rejected',
+			$2, $3)
+	`, freelancerID,
+		fmt.Sprintf("Your submission was rejected. %d slot(s) remaining.", remaining),
+		bid,
+	)
+
 	// Log transaction
 	appIDVal := int64(0)
 	if appID != nil {
@@ -638,9 +711,16 @@ func (h *BountyHandler) RejectSubmission(c *gin.Context) {
 		}
 	}()
 
+	msg := "Submission rejected"
+	if remaining == 0 {
+		msg = "Submission rejected — all slots exhausted. Freelancer can now Let Go or Raise Dispute."
+	} else {
+		msg = fmt.Sprintf("Submission rejected — %d slot(s) remaining for resubmission", remaining)
+	}
+
 	c.JSON(200, models.APIResponse{
 		Success: true,
-		Message: "Submission rejected",
+		Message: msg,
 		Data: gin.H{
 			"submissions_remaining": remaining,
 			"exhausted":             remaining == 0,
@@ -782,7 +862,7 @@ func (h *BountyHandler) InitiateDispute(c *gin.Context) {
 	})
 }
 
-// POST /api/bounties/:id/letgo — Freelancer forfeits, creator refunded
+// POST /api/bounties/:id/letgo — Freelancer forfeits, creator refunded, ratings reset to 0
 func (h *BountyHandler) LetGoBounty(c *gin.Context) {
 	bid := c.Param("id")
 	pid, _ := c.Get("profile_id")
@@ -825,14 +905,25 @@ func (h *BountyHandler) LetGoBounty(c *gin.Context) {
 
 	database.DB.Exec(`UPDATE bounties SET status = 'cancelled', updated_at = NOW() WHERE id = $1`, bid)
 
+	// v3.3: Reset freelancer ratings to 0
+	database.DB.Exec(`
+		UPDATE profiles SET
+		  reputation_score = 0,
+		  avg_rating = 0,
+		  total_ratings = 0
+		WHERE id = $1
+	`, pid)
+
 	appIDVal := int64(0)
 	if appID != nil {
 		appIDVal = *appID
 	}
+
+	// Log transaction for creator (refund)
 	database.DB.Exec(`
 		INSERT INTO transaction_log (bounty_id, actor_id, event, txn_id, txn_note, amount_algo)
 		VALUES ($1, $2, 'freelancer_letgo', $3, $4, $5)
-	`, bid, pid, txID, fmt.Sprintf("BountyVault:freelancer_letgo:%d", appIDVal), rewardAlgo)
+	`, bid, creatorID, txID, fmt.Sprintf("BountyVault:freelancer_letgo:%d", appIDVal), rewardAlgo)
 
 	// Pin let-go metadata to IPFS
 	go func() {
@@ -844,6 +935,7 @@ func (h *BountyHandler) LetGoBounty(c *gin.Context) {
 			FreelancerAddress: freelancerAddr,
 			CreatorAddress:    creatorAddr,
 			RefundedAlgo:      rewardAlgo,
+			RatingReset:       true, // v3.3: freelancer ratings set to 0
 			TxnID:             txID,
 			Network:           h.cfg.AlgoNetwork,
 		})
@@ -854,7 +946,7 @@ func (h *BountyHandler) LetGoBounty(c *gin.Context) {
 
 	c.JSON(200, models.APIResponse{
 		Success: true,
-		Message: "Bounty forfeited — creator will receive refund",
+		Message: "Bounty forfeited — ratings reset, creator will receive refund",
 		Data:    gin.H{"txn_id": txID},
 	})
 }
@@ -871,8 +963,10 @@ func (h *BountyHandler) ListSubmissions(c *gin.Context) {
 	if role.(string) == "creator" {
 		// Creator sees all submissions for their bounty
 		query = `
-			SELECT s.id, s.freelancer_id, s.submission_number, s.file_url, s.file_type,
-			       s.file_size_bytes, s.description, s.status, s.rejection_feedback,
+			SELECT s.id, s.freelancer_id, s.submission_number,
+			       COALESCE(s.mega_nz_link, '') as mega_nz_link,
+			       COALESCE(s.encryption_key_r2_path, '') as encryption_key_r2_path,
+			       s.description, s.status, s.rejection_feedback,
 			       s.creator_message, s.creator_rating, s.work_hash_sha256, s.created_at,
 			       p.username, p.display_name, p.avatar_url, p.reputation_score
 			FROM submissions s JOIN profiles p ON s.freelancer_id = p.id
@@ -881,8 +975,10 @@ func (h *BountyHandler) ListSubmissions(c *gin.Context) {
 	} else {
 		// Freelancer sees only their own submissions
 		query = `
-			SELECT s.id, s.freelancer_id, s.submission_number, s.file_url, s.file_type,
-			       s.file_size_bytes, s.description, s.status, s.rejection_feedback,
+			SELECT s.id, s.freelancer_id, s.submission_number,
+			       COALESCE(s.mega_nz_link, '') as mega_nz_link,
+			       COALESCE(s.encryption_key_r2_path, '') as encryption_key_r2_path,
+			       s.description, s.status, s.rejection_feedback,
 			       s.creator_message, s.creator_rating, s.work_hash_sha256, s.created_at,
 			       p.username, p.display_name, p.avatar_url, p.reputation_score
 			FROM submissions s JOIN profiles p ON s.freelancer_id = p.id
@@ -900,8 +996,8 @@ func (h *BountyHandler) ListSubmissions(c *gin.Context) {
 	subs := []gin.H{}
 	for rows.Next() {
 		var sid, flID string
-		var subNum, fileSize, rep int
-		var fileURL, fileType, desc, status, hash string
+		var subNum, rep int
+		var megaLink, encKeyPath, desc, status, hash string
 		var feedback, msg *string
 		var rating *int
 		var createdAt time.Time
@@ -909,21 +1005,24 @@ func (h *BountyHandler) ListSubmissions(c *gin.Context) {
 		var av *string
 
 		rows.Scan(
-			&sid, &flID, &subNum, &fileURL, &fileType, &fileSize, &desc, &status,
-			&feedback, &msg, &rating, &hash, &createdAt,
+			&sid, &flID, &subNum, &megaLink, &encKeyPath,
+			&desc, &status, &feedback, &msg, &rating, &hash, &createdAt,
 			&un, &dn, &av, &rep,
 		)
 
-		// Generate signed URL for file access
-		signedURL, _ := h.r2Svc.GenerateSignedURL(c.Request.Context(), fileURL)
+		// Generate signed URL for encryption key file access (if present)
+		var signedKeyURL string
+		if encKeyPath != "" {
+			signedKeyURL, _ = h.r2Svc.GenerateSignedURL(c.Request.Context(), encKeyPath)
+		}
 
 		subs = append(subs, gin.H{
 			"id": sid, "freelancer_id": flID, "submission_number": subNum,
-			"file_type": fileType, "file_size_bytes": fileSize,
+			"mega_nz_link": megaLink,
+			"encryption_key_url": signedKeyURL,
 			"description": desc, "status": status, "rejection_feedback": feedback,
 			"creator_message": msg, "creator_rating": rating,
 			"work_hash_sha256": hash, "created_at": createdAt,
-			"signed_file_url": signedURL,
 			"freelancer": gin.H{"username": un, "display_name": dn, "avatar_url": av, "reputation_score": rep},
 		})
 	}
@@ -1329,11 +1428,12 @@ func (h *BountyHandler) ConfirmAcceptance(c *gin.Context) {
 	}
 	h.algoSvc.WaitForConfirmation(c.Request.Context(), txID, 10)
 
-	// Update bounty: set app_id, escrow_txn_id, status -> in_progress
+	// Update bounty: set app_id, escrow_txn_id, accepted_freelancer_id, status -> in_progress
 	database.DB.Exec(`
-		UPDATE bounties SET app_id = $1, escrow_txn_id = $2, status = 'in_progress', updated_at = NOW()
-		WHERE id = $3
-	`, req.AppID, txID, bid)
+		UPDATE bounties SET app_id = $1, escrow_txn_id = $2, accepted_freelancer_id = $3,
+		  status = 'in_progress', updated_at = NOW()
+		WHERE id = $4
+	`, req.AppID, txID, req.FreelancerID, bid)
 
 	// Update acceptance: approved
 	database.DB.Exec(`

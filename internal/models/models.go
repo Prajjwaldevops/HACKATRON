@@ -33,54 +33,58 @@ type Profile struct {
 	UpdatedAt              time.Time `json:"updated_at" db:"updated_at"`
 }
 
-// Bounty represents a bounty record (v3.1)
+// Bounty represents a bounty record (v3.3)
 type Bounty struct {
-	ID                   uuid.UUID `json:"id" db:"id"`
-	BountyID             string    `json:"bounty_id" db:"bounty_id"` // CR00847 format
-	CreatorID            uuid.UUID `json:"creator_id" db:"creator_id"`
-	Title                string    `json:"title" db:"title"`
-	Description          string    `json:"description" db:"description"`
-	RewardAlgo           float64   `json:"reward_algo" db:"reward_algo"`
-	Deadline             time.Time `json:"deadline" db:"deadline"`
-	Status               string    `json:"status" db:"status"`
-	MaxSubmissions       int       `json:"max_submissions" db:"max_submissions"`
-	SubmissionsRemaining int       `json:"submissions_remaining" db:"submissions_remaining"`
-	Tags                 []string  `json:"tags" db:"tags"`
-	AppID                *int64    `json:"app_id" db:"app_id"` // Algorand app ID after lock
-	EscrowTxnID          *string   `json:"escrow_txn_id" db:"escrow_txn_id"`
-	PayoutTxnID          *string   `json:"payout_txn_id" db:"payout_txn_id"`
-	CreatedAt            time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt            time.Time `json:"updated_at" db:"updated_at"`
+	ID                   uuid.UUID  `json:"id" db:"id"`
+	BountyID             string     `json:"bounty_id" db:"bounty_id"` // CR00847 format
+	CreatorID            uuid.UUID  `json:"creator_id" db:"creator_id"`
+	Title                string     `json:"title" db:"title"`
+	Description          string     `json:"description" db:"description"`
+	RewardAlgo           float64    `json:"reward_algo" db:"reward_algo"`
+	Deadline             time.Time  `json:"deadline" db:"deadline"`
+	Status               string     `json:"status" db:"status"`
+	MaxSubmissions       int        `json:"max_submissions" db:"max_submissions"`
+	SubmissionsRemaining int        `json:"submissions_remaining" db:"submissions_remaining"`
+	Tags                 []string   `json:"tags" db:"tags"`
+	AppID                *int64     `json:"app_id" db:"app_id"` // Algorand app ID (per-bounty deployment)
+	EscrowTxnID          *string    `json:"escrow_txn_id" db:"escrow_txn_id"`
+	PayoutTxnID          *string    `json:"payout_txn_id" db:"payout_txn_id"`
+	AcceptedFreelancerID *uuid.UUID `json:"accepted_freelancer_id" db:"accepted_freelancer_id"` // v3.3
+	CreatedAt            time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt            time.Time  `json:"updated_at" db:"updated_at"`
 
 	// Joined fields
 	Creator         *Profile `json:"creator,omitempty"`
 	SubmissionCount int      `json:"submission_count"`
 }
 
-// Submission represents a work submission (v3.1)
+// Submission represents a work submission (v3.3)
 type Submission struct {
-	ID               uuid.UUID  `json:"id" db:"id"`
-	BountyID         uuid.UUID  `json:"bounty_id" db:"bounty_id"`
-	FreelancerID     uuid.UUID  `json:"freelancer_id" db:"freelancer_id"`
-	SubmissionNumber int        `json:"submission_number" db:"submission_number"`
-	FileURL          string     `json:"file_url" db:"file_url"` // Cloudflare R2 object key
-	FileType         string     `json:"file_type" db:"file_type"`
-	FileSizeBytes    int        `json:"file_size_bytes" db:"file_size_bytes"`
-	Description      string     `json:"description" db:"description"`
-	Status           string     `json:"status" db:"status"`
-	RejectionFeedback *string   `json:"rejection_feedback" db:"rejection_feedback"` // Min 50 chars
-	CreatorMessage   *string    `json:"creator_message" db:"creator_message"`
-	CreatorRating    *int       `json:"creator_rating" db:"creator_rating"` // 1-5
-	SubmissionTxnID  *string    `json:"submission_txn_id" db:"submission_txn_id"`
-	WorkHashSHA256   string     `json:"work_hash_sha256" db:"work_hash_sha256"` // On-chain proof
-	ReviewedAt       *time.Time `json:"reviewed_at" db:"reviewed_at"`
-	ResolvedAt       *time.Time `json:"resolved_at" db:"resolved_at"`
-	CreatedAt        time.Time  `json:"created_at" db:"created_at"`
+	ID                  uuid.UUID  `json:"id" db:"id"`
+	BountyID            uuid.UUID  `json:"bounty_id" db:"bounty_id"`
+	FreelancerID        uuid.UUID  `json:"freelancer_id" db:"freelancer_id"`
+	SubmissionNumber    int        `json:"submission_number" db:"submission_number"`
+	FileURL             *string    `json:"file_url" db:"file_url"`           // Legacy R2 path (nullable now)
+	FileType            *string    `json:"file_type" db:"file_type"`         // Legacy
+	FileSizeBytes       *int       `json:"file_size_bytes" db:"file_size_bytes"` // Legacy
+	MegaNZLink          string     `json:"mega_nz_link" db:"mega_nz_link"`   // v3.3: mega.nz download link
+	EncryptionKeyR2Path *string    `json:"encryption_key_r2_path" db:"encryption_key_r2_path"` // v3.3: R2 path to .txt key file
+	EncryptionKeyR2URL  *string    `json:"encryption_key_r2_url" db:"encryption_key_r2_url"`   // v3.3: presigned URL
+	Description         string     `json:"description" db:"description"`
+	Status              string     `json:"status" db:"status"`
+	RejectionFeedback   *string    `json:"rejection_feedback" db:"rejection_feedback"` // Min 50 chars
+	CreatorMessage      *string    `json:"creator_message" db:"creator_message"`
+	CreatorRating       *int       `json:"creator_rating" db:"creator_rating"` // 1-5
+	SubmissionTxnID     *string    `json:"submission_txn_id" db:"submission_txn_id"`
+	WorkHashSHA256      string     `json:"work_hash_sha256" db:"work_hash_sha256"` // On-chain proof
+	ReviewedAt          *time.Time `json:"reviewed_at" db:"reviewed_at"`
+	ResolvedAt          *time.Time `json:"resolved_at" db:"resolved_at"`
+	CreatedAt           time.Time  `json:"created_at" db:"created_at"`
 
 	// Joined
-	Freelancer  *Profile `json:"freelancer,omitempty"`
-	Bounty      *Bounty  `json:"bounty,omitempty"`
-	SignedFileURL string  `json:"signed_file_url,omitempty"` // R2 pre-signed URL (24hr)
+	Freelancer    *Profile `json:"freelancer,omitempty"`
+	Bounty        *Bounty  `json:"bounty,omitempty"`
+	SignedFileURL string   `json:"signed_file_url,omitempty"` // R2 pre-signed URL (24hr) for encryption key
 }
 
 // SubmissionHistoryEntry for dispute submission_history JSONB
@@ -254,6 +258,13 @@ type LetGoRequest struct {
 type CastDAOVoteRequest struct {
 	Vote       string   `json:"vote" binding:"required,oneof=creator freelancer"`
 	SignedTxns []string `json:"signed_txns" binding:"required"`
+}
+
+// SubmitWorkV3Request is the v3.3 submission request (mega.nz + encryption key)
+type SubmitWorkV3Request struct {
+	MegaNZLink  string `json:"mega_nz_link" binding:"required"`  // User-provided mega.nz link
+	Description string `json:"description" binding:"required"`   // Work description
+	// Encryption key .txt file is sent via multipart form field "encryption_key"
 }
 
 type AdminLoginRequest struct {

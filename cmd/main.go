@@ -196,6 +196,8 @@ func main() {
 		// v3.2: Acceptance dashboard views
 		dash.GET("/pending-acceptances", dashboardHandler.GetPendingAcceptances)
 		dash.GET("/my-acceptances", dashboardHandler.GetMyAcceptances)
+		// v3.3: Transaction log
+		dash.GET("/transactions", dashboardHandler.GetTransactionLog)
 	}
 
 	// --- Bounty Status (protected) ---
