@@ -1,1 +1,3 @@
-frontend and backend are not opening in the main2 and backend branches
+FRONTEND AND BACKEND ARE WITH BLOB ISSUES CANT BE OPENED FULL CODE IN THE DRIVE LINK
+
+https://drive.google.com/file/d/1eNO8e9UPZCtuuir-NVkoh7Qz5-XKa1FO/view?usp=drive_link
